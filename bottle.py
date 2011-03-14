@@ -384,6 +384,44 @@ class Router(object):
 # Application Object ###########################################################
 ###############################################################################
 
+#: A thread-save namepsace.
+local = threading.local()
+#: Current request :class:`Context`
+local._context = None
+
+class Context(object):
+    ''' A context stores data related to a specific request in a thread-local
+        and stack-able way. Some global objects (e.g. :data:`request`) need to
+        refer to the `current` request and won't work without a valid context.
+        
+        Contexts need to be thread-local to support global access in multi-
+        threaded environments. They are stack-able to allow applications to call
+        other applications without sharing their context. Use the ``with``
+        statement to automatically push/pop a new context to/from the stack.
+    '''
+    def __init__(self, persist=False, **config):
+        self.persistent = False
+        if config: self.__dict__.update(config)
+
+    def __enter__(self):
+        self._backup, local._context = local._context, self
+        return self
+    
+    def __exit__(self, etype, eval, etb):
+        if not local._context is self:
+            raise RuntimeError("Could not pop from stack. Wrong head.")
+        if not self.persistent:
+            local._context = self._backup
+
+def get_context():
+    ''' Return the current :class:`Context` or raise RuntimeError. '''
+    # Sometimes it is faster to use local.current directly and catch the error.
+    if not local._context:
+        raise RuntimeError("No context on stack. Create a context first.")
+    return local._context
+
+
+
 
 class Bottle(object):
     """ WSGI application """
@@ -703,17 +741,18 @@ class Bottle(object):
     def wsgi(self, environ, start_response):
         """ The bottle WSGI-interface. """
         try:
-            environ['bottle.app'] = self
-            request.bind(environ)
-            response.bind()
-            out = self.handle(environ)
-            out = self._cast(out, request, response)
-            # rfc2616 section 4.3
-            if response.status in (100, 101, 204, 304) or request.method == 'HEAD':
-                if hasattr(out, 'close'): out.close()
-                out = []
-            status = '%d %s' % (response.status, HTTP_CODES[response.status])
-            start_response(status, response.headerlist)
+            with Context(environ=environ) as ctx:
+                request.bind(environ)
+                response.bind()
+                environ['bottle.app'] = self
+                out = self.handle(environ)
+                out = self._cast(out, request, response)
+                # rfc2616 section 4.3
+                if response.status in (100, 101, 204, 304) or request.method == 'HEAD':
+                    if hasattr(out, 'close'): out.close()
+                    out = []
+                status = '%d %s' % (response.status, HTTP_CODES[response.status])
+                start_response(status, response.headerlist)
             return out
         except (KeyboardInterrupt, SystemExit, MemoryError):
             raise
@@ -741,28 +780,23 @@ class Bottle(object):
 ###############################################################################
 
 
-class Request(threading.local, DictMixin):
-    """ Represents a single HTTP request using thread-local attributes.
-        The Request object wraps a WSGI environment and can be used as such.
+class Request(DictMixin):
+    """ A Request object wraps a WSGI environment and represents a single HTTP
+        request. In Bottle applications, you usually don't use this but the
+        global :data:`request` object.
     """
-    def __init__(self, environ=None):
-        """ Create a new Request instance.
 
-            You usually don't do this but use the global `bottle.request`
-            instance instead.
-        """
-        self.bind(environ or {},)
-
-    def bind(self, environ):
-        """ Bind a new WSGI environment.
-
-            This is done automatically for the global `bottle.request`
-            instance on every request.
-        """
+    def __init__(self, environ):
+        """ Create a new stand-alone Request instance. """
         self.environ = environ
-        # These attributes are used anyway, so it is ok to compute them here
-        self.path = '/' + environ.get('PATH_INFO', '/').lstrip('/')
-        self.method = environ.get('REQUEST_METHOD', 'GET').upper()
+
+    @property
+    def path(self):
+        return '/' + self.environ.get('PATH_INFO', '/').lstrip('/')
+
+    @property
+    def method(self):
+        return self.environ.get('REQUEST_METHOD', 'GET').upper()
 
     @property
     def _environ(self):
@@ -976,17 +1010,15 @@ class Request(threading.local, DictMixin):
         #TODO: write tests
         return self.header.get('X-Requested-With') == 'XMLHttpRequest'
 
+        
+          
 
-class Response(threading.local):
+class Response(object):
     """ Represents a single HTTP response using thread-local attributes.
     """
 
     def __init__(self):
-        self.bind()
-
-    def bind(self):
-        """ Resets the Response object to its factory defaults. """
-        self._COOKIES = None
+        self._COOKIES = SimpleCookie()
         self.status = 200
         self.headers = HeaderDict()
         self.content_type = 'text/html; charset=UTF-8'
@@ -1034,8 +1066,6 @@ class Response(threading.local):
     @property
     def COOKIES(self):
         """ A dict-like SimpleCookie instance. Use :meth:`set_cookie` instead. """
-        if not self._COOKIES:
-            self._COOKIES = SimpleCookie()
         return self._COOKIES
 
     def set_cookie(self, key, value, secret=None, **kargs):
@@ -1088,6 +1118,73 @@ class Response(threading.local):
 
     content_type = property(get_content_type, set_content_type, None,
                             get_content_type.__doc__)
+
+
+
+                            
+class LocalRequest(Request):
+    ''' A thread-local version of :class:`Request` that uses the global
+        :class:`Context` stack to store the environ dictionary. '''
+
+    def __init__(self):
+        ''' Use :meth:`bind` to bind a new WSGI environ as soon as a valid
+            context exists. '''
+        pass
+
+    def bind(self, environ):
+        ''' Bind a new environ to the current context. '''
+        try:
+            local._context.environ = environ
+        except AttributeError:
+            raise RuntimeError("Called out of context. ")
+
+    @property
+    def environ(self):
+        try:
+            return local._context.environ
+        except AttributeError:
+            raise RuntimeError("Called out of context. ")
+
+
+class LocalResponse(Response):
+    def __init__(self):
+        ''' Use :meth:`bind` to bind a new WSGI environ as soon as a valid
+            context exists. '''
+        pass
+
+    def bind(self):
+        ''' Bind new values to the current context. '''
+        try:
+            local._context._COOKIES = SimpleCookie()
+            local._context.status = 200
+            local._context.headers = HeaderDict()
+        except AttributeError:
+            raise RuntimeError("Called out of context. ")
+
+    @property
+    def _COOKIES(self):
+        try: return local._context._COOKIES
+        except AttributeError:
+            raise RuntimeError("Called out of context. ")
+
+    @property
+    def status(self):
+        try: return local._context.status
+        except AttributeError:
+            raise RuntimeError("Called out of context. ")
+
+    @property
+    def headers(self):
+        try: return local._context.headers
+        except AttributeError:
+            raise RuntimeError("Called out of context. ")
+
+            
+#: A thread-save instance of :class:`Request` representing the `current` request.
+request = LocalRequest()
+
+#: A thread-save instance of :class:`Response` used to build the HTTP response.
+response = LocalResponse()
 
 
 
@@ -2405,14 +2502,6 @@ ERROR_PAGE_TEMPLATE = """
 %end
 """
 
-#: A thread-save instance of :class:`Request` representing the `current` request.
-request = Request()
-
-#: A thread-save instance of :class:`Response` used to build the HTTP response.
-response = Response()
-
-#: A thread-save namepsace. Not used by Bottle.
-local = threading.local()
 
 # Initialize app stack (create first empty Bottle app)
 # BC: 0.6.4 and needed for run()
