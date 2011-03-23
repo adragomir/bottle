@@ -38,9 +38,14 @@ import warnings
 
 from Cookie import SimpleCookie
 from tempfile import TemporaryFile
-from traceback import format_exc
+from traceback import format_exc, print_exc
 from urllib import urlencode
 from urlparse import urlunsplit, urljoin
+
+from Queue import Empty
+
+from multiprocessing import Process, Queue, Event
+from multiprocessing import active_children
 
 try: from collections import MutableMapping as DictMixin
 except ImportError: # pragma: no cover
@@ -93,6 +98,42 @@ else:
     tonat = tob
 tonat.__doc__ = """ Convert anything to native strings """
 
+
+class classinstancemethod(object):
+    """
+    Acts like a class method when called from a class, like an
+    instance method when called by an instance.  The method should
+    take two arguments, 'self' and 'cls'; one of these will be None
+    depending on how the method was called.
+    """
+
+    def __init__(self, func):
+        self.func = func
+        self.__doc__ = func.__doc__
+
+    def __get__(self, obj, type=None):
+        return _methodwrapper(self.func, obj=obj, type=type)
+
+class _methodwrapper(object):
+
+    def __init__(self, func, obj, type):
+        self.func = func
+        self.obj = obj
+        self.type = type
+
+    def __call__(self, *args, **kw):
+        assert not kw.has_key('self') and not kw.has_key('cls'), (
+            "You cannot use 'self' or 'cls' arguments to a "
+            "classinstancemethod")
+        return self.func(*((self.obj, self.type) + args), **kw)
+
+    def __repr__(self):
+        if self.obj is None:
+            return ('<bound class method %s.%s>'
+                    % (self.type.__name__, self.func.func_name))
+        else:
+            return ('<bound method %s.%s of %r>'
+                    % (self.type.__name__, self.func.func_name, self.obj))
 
 # Backward compatibility
 def depr(message, critical=False):
@@ -1765,6 +1806,13 @@ class BjoernServer(ServerAdapter):
         run(handler, self.host, self.port)
 
 
+class Mongrel2Server(ServerAdapter):
+    def run(self, app_handler):
+        from mongrel2 import handler
+        from mongrel2_wsgi import wsgi_server
+        print "Starting 0MQ server."
+        wsgi_server(app_handler, handler.Connection("279a117-5be1-4da7-9c4e-702b3412baba", "tcp://127.0.0.1:9997", "tcp://127.0.0.1:9996"))
+
 class AutoServer(ServerAdapter):
     """ Untested. """
     adapters = [PasteServer, CherryPyServer, TwistedServer, WSGIRefServer]
@@ -1793,13 +1841,124 @@ server_names = {
     'gevent': GeventServer,
     'rocket': RocketServer,
     'bjoern' : BjoernServer,
+    'mongrel2': Mongrel2Server,
     'auto': AutoServer,
 }
 
 
+########################################################
+# Advanced reloading
+########################################################
+POLL_INTERVAL = 1   # check for changes every n seconds.
+SPINUP_TIME = 10    # application must start within this time.
+class ReloadingMonitor(object):
 
+    instances = []
+    global_extra_files = []
+    global_file_callbacks = []
 
+    def __init__(self, tx=None, rx=None, poll_interval=POLL_INTERVAL):
+        self.module_mtimes = {}
+        self.keep_running = True
+        self.poll_interval = poll_interval
+        self.extra_files = list(self.global_extra_files)
+        self.instances.append(self)
+        self.file_callbacks = list(self.global_file_callbacks)
 
+        self.state = 'RUN'
+        self.tx = tx
+        self.rx = rx
+
+    def periodic_reload(self):
+        while not self.rx.is_set():
+            if not self.check_reload():
+                self.state = 'STANDBY'
+                # inform code change
+                self.tx.put({'pid':os.getpid(), 'status':'changed'})
+                self.rx.wait(SPINUP_TIME)
+                if self.rx.is_set():
+                    return
+                self.state = 'RUN'
+                self.module_mtimes = {}
+            time.sleep(self.poll_interval)
+
+    def check_reload(self):
+        filenames = list(self.extra_files)
+        for file_callback in self.file_callbacks:
+            try:
+                filenames.extend(file_callback())
+            except:
+                print >> sys.stderr, "Error calling reloader callback %r:" % file_callback
+                traceback.print_exc()
+        for module in sys.modules.values():
+            try:
+                filename = module.__file__
+            except (AttributeError, ImportError), exc:
+                continue
+            if filename is not None:
+                filenames.append(filename)
+        for filename in filenames:
+            try:
+                stat = os.stat(filename)
+                if stat:
+                    mtime = stat.st_mtime
+                else:
+                    mtime = 0
+            except (OSError, IOError):
+                continue
+            if filename.endswith('.pyc') and os.path.exists(filename[:-1]):
+                mtime = max(os.stat(filename[:-1]).st_mtime, mtime)
+            elif filename.endswith('$py.class') and \
+                    os.path.exists(filename[:-9] + '.py'):
+                mtime = max(os.stat(filename[:-9] + '.py').st_mtime, mtime)
+            if not self.module_mtimes.has_key(filename):
+                self.module_mtimes[filename] = mtime
+            elif self.module_mtimes[filename] < mtime:
+                print >> sys.stderr, (
+                    "%s changed; reloading..." % filename)
+                return False
+        return True
+
+    def watch_file(self, cls, filename):
+        """Watch the named file for changes"""
+        filename = os.path.abspath(filename)
+        if self is None:
+            for instance in cls.instances:
+                instance.watch_file(filename)
+            cls.global_extra_files.append(filename)
+        else:
+            self.extra_files.append(filename)
+
+    watch_file = classinstancemethod(watch_file)
+
+    def add_file_callback(self, cls, callback):
+        """Add a callback -- a function that takes no parameters -- that will
+        return a list of filenames to watch for changes."""
+        if self is None:
+            for instance in cls.instances:
+                instance.add_file_callback(callback)
+            cls.global_file_callbacks.append(callback)
+        else:
+            self.file_callbacks.append(callback)
+
+    add_file_callback = classinstancemethod(add_file_callback)
+
+def _reloader_new_serve(server, app, interval, tx, rx):
+    try:
+        tx.put({'pid':os.getpid(), 'status':'loaded'})
+
+        def go():
+            server.run(app)
+
+        t = threading.Thread(target=go)
+        t.setDaemon(True)
+        t.start()
+
+        monitor = ReloadingMonitor(tx=tx, rx=rx, poll_interval=interval)
+        monitor.periodic_reload()
+
+    except KeyboardInterrupt:
+        pass
 
 ###############################################################################
 # Application Control ##########################################################
@@ -1889,12 +2048,41 @@ def run(app=None, server='wsgiref', host='127.0.0.1', port=8080,
         print "Use Ctrl-C to quit."
         print
     try:
-        if reloader:
+        if False: # old reloading !!!
             interval = min(interval, 1)
             if os.environ.get('BOTTLE_CHILD'):
                 _reloader_child(server, app, interval)
             else:
                 _reloader_observer(server, app, interval)
+        if reloader:
+            print "reloader !!!"
+            interval = min(interval, 1)
+            # tx, rx from the subprocess' perspective.   
+            tx = Queue()
+
+            def spinup():
+                rx = Event()
+                worker = Process(target=_reloader_new_serve, args=(server, app, interval, tx, rx))
+                worker.rx = rx
+                worker.start()
+                return worker
+
+            spinup()
+
+            while True:
+                try:
+                    msg = tx.get(True, 1)
+                    sys.stderr.write("%r\n" % msg)
+                    if msg['status'] == 'changed':
+                        spinup()
+                    elif msg['status'] == 'loaded':
+                        for worker in active_children():
+                            if worker.ident != msg['pid']:
+                                worker.rx.set()
+                except Empty:
+                    if not active_children():
+                        return
+
         else:
             server.run(app)
     except KeyboardInterrupt:
