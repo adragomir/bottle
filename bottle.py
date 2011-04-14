@@ -2048,13 +2048,13 @@ def run(app=None, server='wsgiref', host='127.0.0.1', port=8080,
         print "Use Ctrl-C to quit."
         print
     try:
-        if False: # old reloading !!!
+        if reloader: # old reloading !!!
             interval = min(interval, 1)
             if os.environ.get('BOTTLE_CHILD'):
                 _reloader_child(server, app, interval)
             else:
                 _reloader_observer(server, app, interval)
-        if reloader:
+        elif False:
             print "reloader !!!"
             interval = min(interval, 1)
             # tx, rx from the subprocess' perspective.   
